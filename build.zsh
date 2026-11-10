@@ -63,6 +63,6 @@ cp "$BUILD_DIR/icon-1024.png" "$ICONSET/icon_512x512@2x.png"
 iconutil -c icns "$ICONSET" -o "$RESOURCES_DIR/DiaZhHelper.icns"
 
 codesign --force --deep --sign - --timestamp=none "$APP_DIR"
-ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$OUTPUT_DIR/Dia中文补丁助手-1.0.0.zip"
+ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$OUTPUT_DIR/DiaZhHelper-1.0.0.zip"
 
 print -r -- "$APP_DIR"

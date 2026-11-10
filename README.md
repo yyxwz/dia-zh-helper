@@ -21,7 +21,7 @@
 
 ## 安装
 
-从 [Releases](https://github.com/yyxwz/dia-zh-helper/releases) 下载 `Dia中文补丁助手-1.0.0.zip`，解压后将应用拖入“应用程序”。
+从 [Releases](https://github.com/yyxwz/dia-zh-helper/releases) 下载 `DiaZhHelper-1.0.0.zip`，解压后将应用拖入“应用程序”。
 
 首次打开后：
 
