@@ -1,0 +1,25 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  macos:
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: |
+          chmod +x build.zsh
+          ./build.zsh
+      - name: Verify bundle
+        run: codesign --verify --deep --strict --verbose=2 "outputs/Dia 中文补丁助手.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DiaZhHelper-${{ github.sha }}
+          path: outputs/Dia中文补丁助手-1.0.0.zip
