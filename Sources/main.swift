@@ -20,23 +20,26 @@ final class PatchManager {
     }
 
     private var patchCommand: URL {
-        patchDirectory.appendingPathComponent("dia-zh.command")
+        patchDirectory.appendingPathComponent("helper-driver.zsh")
     }
 
     private init() {}
 
-    func runPatch(_ command: String, environment extra: [String: String] = [:]) -> CommandResult {
+    func runPatch(_ command: String, onOutput: ((String) -> Void)? = nil) -> CommandResult {
         guard FileManager.default.fileExists(atPath: patchCommand.path) else {
             return CommandResult(code: 127, output: "找不到内置补丁：\(patchCommand.path)")
         }
         var environment = ProcessInfo.processInfo.environment
-        extra.forEach { environment[$0] = $1 }
+        for key in environment.keys.filter({ $0.hasPrefix("DIA_") }) { environment.removeValue(forKey: key) }
+        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
+        environment["DIA_ZH_MODE"] = "core"
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = [patchCommand.path, command]
         process.currentDirectoryURL = patchDirectory
         process.environment = environment
+        process.standardInput = FileHandle.nullDevice
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -46,9 +49,18 @@ final class PatchManager {
         } catch {
             return CommandResult(code: 126, output: "无法启动补丁：\(error.localizedDescription)")
         }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        var data = Data()
+        while true {
+            let chunk = pipe.fileHandleForReading.availableData
+            if chunk.isEmpty { break }
+            data.append(chunk)
+            // Accumulate complete lines so a UTF-8 character split across reads
+            // cannot garble progress messages.
+            if let text = String(data: data, encoding: .utf8) { onOutput?(text) }
+        }
         process.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
+        if command != "status" { appendLog("\(command) (exit \(process.terminationStatus))\n\(output)") }
         return CommandResult(code: process.terminationStatus, output: output)
     }
 
@@ -56,11 +68,10 @@ final class PatchManager {
         runPatch("status")
     }
 
-    func install(interactive: Bool) -> CommandResult {
-        let environment = interactive
-            ? ["DIA_ZH_ASSUME_SMOKE_OK": "1"]
-            : ["DIA_ZH_SKIP_SMOKE": "1"]
-        return runPatch("apply", environment: environment)
+    func install(interactive: Bool, onOutput: ((String) -> Void)? = nil) -> CommandResult {
+        let result = runPatch(interactive ? "repair" : "repair-background", onOutput: onOutput)
+        if result.code == 0 { UserDefaults.standard.removeObject(forKey: "failedAutomaticVersion") }
+        return result
     }
 
     func restore() -> CommandResult {
@@ -72,45 +83,28 @@ final class PatchManager {
     }
 
     func automaticCheck() {
-        appendLog("开始自动检查。")
         guard FileManager.default.fileExists(atPath: appPath) else {
             appendLog("未找到 /Applications/Dia.app。")
             return
         }
 
         let current = status()
-        appendLog(current.output.trimmingCharacters(in: .whitespacesAndNewlines))
         guard current.code == 0 else {
-            appendLog("状态检查失败，未进行写入。")
             return
         }
-
-        if current.output.contains("补丁状态：applied") &&
-            current.output.contains("有效的统一 ad-hoc 签名") {
-            appendLog("当前版本已安装补丁。")
-            return
-        }
-        guard current.output.contains("签名：Dia 官方签名") else {
-            appendLog("Dia 不是可识别的官方签名，自动模式不会修改。")
-            return
-        }
-        guard !current.output.contains("覆盖级别：incompatible") else {
-            appendLog("当前 Dia 结构不兼容，自动模式不会修改。")
-            notify(title: "Dia 中文补丁助手", message: "新版 Dia 暂不兼容，已保留官方原版。")
-            return
-        }
-        guard !isDiaRunning() else {
-            appendLog("检测到官方更新，但 Dia 正在运行；等待退出后再安装。")
-            return
-        }
+        let state = PatchStatus(current.output)
+        if state.isVerified { return }
+        guard state.isOfficial, state.fields["覆盖级别"] != "incompatible", !isDiaRunning() else { return }
+        // Do not repeat a failed mutation every five minutes on the same build.
+        if UserDefaults.standard.string(forKey: "failedAutomaticVersion") == state.version { return }
 
         appendLog("检测到官方更新，开始安全重装。")
         let result = install(interactive: false)
-        appendLog(result.output.trimmingCharacters(in: .whitespacesAndNewlines))
         if result.code == 0 {
-            notify(title: "Dia 中文补丁助手", message: "新版 Dia 的中文补丁已自动安装。")
-        } else {
-            notify(title: "Dia 中文补丁助手", message: "自动安装失败，已尝试恢复官方原版。")
+            notify(title: "Dia 中文补丁助手", message: "核心汉化资源已安装并校验，待下次启动 Dia 验证。")
+        } else if result.code != 75 {
+            UserDefaults.standard.set(state.version, forKey: "failedAutomaticVersion")
+            notify(title: "Dia 中文补丁助手", message: "自动修复未完成，请打开助手查看日志并修复。")
         }
     }
 
@@ -206,6 +200,7 @@ final class LaunchAgentManager {
 }
 
 final class MainWindowController: NSWindowController {
+    private(set) var isBusy = false
     private let statusTitle = NSTextField(labelWithString: "正在检查 Dia…")
     private let statusDetail = NSTextField(wrappingLabelWithString: "")
     private let logView = NSTextView()
@@ -276,10 +271,10 @@ final class MainWindowController: NSWindowController {
             statusStack.bottomAnchor.constraint(equalTo: statusBox.contentView!.bottomAnchor, constant: -14)
         ])
 
-        let installButton = makeButton("安装 / 重新安装", action: #selector(installPatch), prominent: true)
+        let installButton = makeButton("检查并修复", action: #selector(installPatch), prominent: true)
         let refreshButton = makeButton("重新检测", action: #selector(refreshButtonPressed))
         let restoreButton = makeButton("恢复官方版", action: #selector(restoreOfficial))
-        let openButton = makeButton("打开 Dia", action: #selector(openDia))
+        let openButton = makeButton("打开并验证 Dia", action: #selector(openDia))
         operationButtons = [installButton, refreshButton, restoreButton, openButton]
         let buttonRow = NSStackView(views: operationButtons)
         buttonRow.orientation = .horizontal
@@ -341,6 +336,7 @@ final class MainWindowController: NSWindowController {
     }
 
     private func setBusy(_ busy: Bool) {
+        isBusy = busy
         operationButtons.forEach { $0.isEnabled = !busy }
         autoCheck.isEnabled = !busy
         busy ? progress.startAnimation(nil) : progress.stopAnimation(nil)
@@ -361,22 +357,10 @@ final class MainWindowController: NSWindowController {
             statusDetail.stringValue = result.output
             return
         }
-        let lines = result.output.components(separatedBy: .newlines)
-        let version = lines.first { $0.hasPrefix("版本：") } ?? "版本：未知"
-        let patch = lines.first { $0.hasPrefix("补丁状态：") } ?? "补丁状态：未知"
-        let coverage = lines.first { $0.hasPrefix("覆盖级别：") } ?? "覆盖级别：未知"
-        let signature = lines.first { $0.hasPrefix("签名：") } ?? "签名：未知"
-        if patch.contains("applied") {
-            statusTitle.stringValue = "中文补丁已生效"
-            statusTitle.textColor = .systemGreen
-        } else if signature.contains("官方签名") {
-            statusTitle.stringValue = "检测到官方 Dia，等待安装补丁"
-            statusTitle.textColor = .systemOrange
-        } else {
-            statusTitle.stringValue = "需要人工检查"
-            statusTitle.textColor = .systemRed
-        }
-        statusDetail.stringValue = [version, patch, coverage, signature].joined(separator: "  ·  ")
+        let state = PatchStatus(result.output)
+        statusTitle.stringValue = state.title
+        statusTitle.textColor = state.isVerified ? .systemGreen : .systemOrange
+        statusDetail.stringValue = state.detail
     }
 
     private func refreshStatus() {
@@ -394,11 +378,18 @@ final class MainWindowController: NSWindowController {
 
     @objc private func installPatch() {
         setBusy(true)
-        append("开始安装；如果 Dia 正在运行，将先安全退出……")
+        statusTitle.stringValue = "正在检查并修复…"
+        append("正在检查并修复；备份和签名可能需要几分钟，请等待完成。")
+        let initialLog = logView.string + "\n"
         DispatchQueue.global(qos: .userInitiated).async {
-            let result = PatchManager.shared.install(interactive: true)
+            let result = PatchManager.shared.install(interactive: true, onOutput: { output in
+                DispatchQueue.main.async {
+                    self.logView.string = initialLog + output
+                    self.logView.scrollToEndOfDocument(nil)
+                }
+            })
             DispatchQueue.main.async {
-                self.append(result.output)
+                self.append(result.code == 0 ? "修复完成，正在重新核验资源。" : "修复未完成，请查看上方错误。")
                 self.setBusy(false)
                 self.refreshStatus()
                 if result.code != 0 { NSSound.beep() }
@@ -425,9 +416,14 @@ final class MainWindowController: NSWindowController {
     }
 
     @objc private func openDia() {
-        let url = URL(fileURLWithPath: PatchManager.shared.appPath)
-        NSWorkspace.shared.openApplication(at: url, configuration: .init()) { _, error in
-            if let error = error { DispatchQueue.main.async { self.append("打开 Dia 失败：\(error.localizedDescription)") } }
+        setBusy(true)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = PatchManager.shared.runPatch("launch")
+            DispatchQueue.main.async {
+                self.append(result.output)
+                self.setBusy(false)
+                self.refreshStatus()
+            }
         }
     }
 
@@ -489,8 +485,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if windowController?.isBusy == true {
+            windowController?.showWindow(nil)
+            NSSound.beep()
+            return .terminateCancel
+        }
+        return .terminateNow
+    }
 }
 
+// CLI checks finish without creating an AppKit event loop or UI windows.
+if let command = CommandLine.arguments.dropFirst().first,
+   ["--status", "--audit", "--repair", "--repair-background"].contains(command) {
+    let result = PatchManager.shared.runPatch(String(command.dropFirst(2)), onOutput: nil)
+    print(result.output)
+    exit(result.code)
+}
 let application = NSApplication.shared
 let applicationDelegate = AppDelegate()
 application.delegate = applicationDelegate

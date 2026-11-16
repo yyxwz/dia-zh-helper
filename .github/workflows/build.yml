@@ -19,7 +19,9 @@ jobs:
           ./build.zsh
       - name: Verify bundle
         run: codesign --verify --deep --strict --verbose=2 "outputs/Dia 中文补丁助手.app"
+      - name: Regression tests
+        run: ./Tests/run.zsh
       - uses: actions/upload-artifact@v4
         with:
           name: DiaZhHelper-${{ github.sha }}
-          path: outputs/DiaZhHelper-1.0.0.zip
+          path: outputs/DiaZhHelper-*.zip
